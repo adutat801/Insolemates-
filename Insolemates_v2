@@ -1,0 +1,1639 @@
+//  RootView.swift
+//  Insolemates
+
+import SwiftUI
+import CoreBluetooth
+import Charts
+import Foundation
+import FirebaseAuth
+import FirebaseFirestore
+
+// MARK: - BLE Manager
+
+struct DiscoveredBLEDevice: Identifiable, Hashable {
+    let id: UUID
+    let peripheral: CBPeripheral
+    var name: String
+    var rssi: Int
+}
+
+final class WalkPressureBLE: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+
+    @Published var isConnected: Bool = false
+    @Published var statusText: String = "Bluetooth starting…"
+    @Published var discoveredDevices: [DiscoveredBLEDevice] = []
+    @Published var selectedDeviceID: UUID?
+
+    @Published var stepsTotal: UInt32 = 0
+    @Published var stepsToes: UInt32 = 0
+    @Published var stepsMid: UInt32 = 0
+    @Published var stepsHeel: UInt32 = 0
+
+    private var central: CBCentralManager!
+    private var peripheral: CBPeripheral?
+
+    private let serviceUUID = CBUUID(string: "d3b7f3c0-2a1b-4b3d-9af9-2b08a6e3a001")
+    private let logCharUUID = CBUUID(string: "d3b7f3c0-2a1b-4b3d-9af9-2b08a6e3a002")
+
+    private var receivingStarted = false
+    private var completed = false
+
+    override init() {
+        super.init()
+        central = CBCentralManager(delegate: self, queue: nil)
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        switch central.state {
+        case .poweredOn:
+            DispatchQueue.main.async {
+                self.statusText = "Bluetooth ready. Tap Scan."
+            }
+
+        case .poweredOff:
+            DispatchQueue.main.async {
+                self.isConnected = false
+                self.statusText = "Bluetooth is off"
+                self.discoveredDevices = []
+            }
+
+        case .unauthorized:
+            DispatchQueue.main.async {
+                self.isConnected = false
+                self.statusText = "Bluetooth permission not granted"
+                self.discoveredDevices = []
+            }
+
+        default:
+            DispatchQueue.main.async {
+                self.isConnected = false
+                self.statusText = "Bluetooth unavailable"
+                self.discoveredDevices = []
+            }
+        }
+    }
+
+    func startScan() {
+        guard central.state == .poweredOn else { return }
+
+        completed = false
+        receivingStarted = false
+
+        DispatchQueue.main.async {
+            self.discoveredDevices = []
+            self.statusText = "Scanning for BLE_StepLogger devices…"
+        }
+
+        central.scanForPeripherals(withServices: [serviceUUID], options: [
+            CBCentralManagerScanOptionAllowDuplicatesKey: false
+        ])
+    }
+
+    func stopScan() {
+        central.stopScan()
+        DispatchQueue.main.async {
+            if !self.isConnected {
+                self.statusText = "Scan stopped"
+            }
+        }
+    }
+
+    func connectToDevice(_ device: DiscoveredBLEDevice) {
+        central.stopScan()
+
+        self.peripheral = device.peripheral
+        self.peripheral?.delegate = self
+
+        DispatchQueue.main.async {
+            self.statusText = "Connecting to \(device.name)…"
+            self.selectedDeviceID = device.id
+        }
+
+        central.connect(device.peripheral, options: nil)
+    }
+
+    func disconnectCurrentDevice() {
+        if let peripheral {
+            central.cancelPeripheralConnection(peripheral)
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager,
+                        didDiscover peripheral: CBPeripheral,
+                        advertisementData: [String: Any],
+                        rssi RSSI: NSNumber) {
+
+        let advertisedName =
+            (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
+            ?? peripheral.name
+            ?? "Unnamed Device"
+
+        let device = DiscoveredBLEDevice(
+            id: peripheral.identifier,
+            peripheral: peripheral,
+            name: advertisedName,
+            rssi: RSSI.intValue
+        )
+
+        DispatchQueue.main.async {
+            if let index = self.discoveredDevices.firstIndex(where: { $0.id == device.id }) {
+                self.discoveredDevices[index] = device
+            } else {
+                self.discoveredDevices.append(device)
+            }
+
+            self.discoveredDevices.sort { lhs, rhs in
+                lhs.rssi > rhs.rssi
+            }
+
+            self.statusText = "Found \(self.discoveredDevices.count) device(s). Select one."
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager,
+                        didConnect peripheral: CBPeripheral) {
+        DispatchQueue.main.async {
+            self.isConnected = true
+            let name = peripheral.name ?? "device"
+            self.statusText = "Connected to \(name). Waiting for upload button."
+        }
+        peripheral.discoverServices([serviceUUID])
+    }
+
+    func centralManager(_ central: CBCentralManager,
+                        didFailToConnect peripheral: CBPeripheral,
+                        error: Error?) {
+        DispatchQueue.main.async {
+            self.isConnected = false
+            self.statusText = "Failed to connect"
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager,
+                        didDisconnectPeripheral peripheral: CBPeripheral,
+                        error: Error?) {
+        DispatchQueue.main.async {
+            self.isConnected = false
+            self.statusText = "Disconnected"
+            self.selectedDeviceID = nil
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard error == nil else {
+            DispatchQueue.main.async { self.statusText = "Service discovery error" }
+            return
+        }
+
+        guard let services = peripheral.services else { return }
+
+        for service in services where service.uuid == serviceUUID {
+            peripheral.discoverCharacteristics([logCharUUID], for: service)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral,
+                    didDiscoverCharacteristicsFor service: CBService,
+                    error: Error?) {
+        guard error == nil else {
+            DispatchQueue.main.async { self.statusText = "Characteristic discovery error" }
+            return
+        }
+
+        guard let chars = service.characteristics else { return }
+
+        for characteristic in chars where characteristic.uuid == logCharUUID {
+            peripheral.setNotifyValue(true, for: characteristic)
+            peripheral.readValue(for: characteristic)
+            resetDerivedStats()
+
+            DispatchQueue.main.async {
+                self.statusText = "Ready. Press button on the selected device to upload."
+            }
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral,
+                    didUpdateValueFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        guard error == nil else {
+            DispatchQueue.main.async { self.statusText = "Read/notify error." }
+            return
+        }
+
+        guard characteristic.uuid == logCharUUID else { return }
+        guard let data = characteristic.value else { return }
+
+        parseIncomingChunk(data)
+    }
+
+    private func resetDerivedStats() {
+        DispatchQueue.main.async {
+            self.stepsTotal = 0
+            self.stepsToes = 0
+            self.stepsMid = 0
+            self.stepsHeel = 0
+        }
+        receivingStarted = false
+        completed = false
+    }
+
+    private struct StepBits {
+        let toes: Bool
+        let mid: Bool
+        let heel: Bool
+    }
+
+    private func decodeNibble(_ n: UInt8) -> StepBits {
+        StepBits(
+            toes: (n & 0b0001) != 0,
+            mid:  (n & 0b0010) != 0,
+            heel: (n & 0b0100) != 0
+        )
+    }
+
+    private func consumeNibble(_ nib: UInt8,
+                               total: inout UInt32,
+                               toes: inout UInt32,
+                               mid: inout UInt32,
+                               heel: inout UInt32) {
+        let bits = decodeNibble(nib)
+        total += 1
+        if bits.toes { toes += 1 }
+        if bits.mid { mid += 1 }
+        if bits.heel { heel += 1 }
+    }
+
+    private func parseIncomingChunk(_ data: Data) {
+        if data.count == 1 {
+            let b = data[data.startIndex]
+            if b == 0xAA { return }
+
+            if b == 0xEE {
+                DispatchQueue.main.async {
+                    self.stepsTotal = 0
+                    self.stepsToes = 0
+                    self.stepsMid = 0
+                    self.stepsHeel = 0
+                    self.statusText = "No log stored (empty)."
+                }
+                completed = true
+                receivingStarted = true
+                return
+            }
+        }
+
+        if data.count == 2 {
+            let a = data[data.startIndex]
+            let b = data[data.index(after: data.startIndex)]
+            if a == 0xEF && b == 0xEF {
+                completed = true
+                DispatchQueue.main.async {
+                    self.statusText = "Upload complete"
+                }
+                return
+            }
+        }
+
+        if let s = String(data: data, encoding: .utf8), s == "BTN" {
+            DispatchQueue.main.async {
+                self.statusText = "Button pressed. Receiving…"
+            }
+            receivingStarted = true
+            return
+        }
+
+        if !receivingStarted {
+            receivingStarted = true
+            DispatchQueue.main.async {
+                self.statusText = "Receiving… (streaming log)"
+            }
+        }
+
+        var newTotal: UInt32 = 0
+        var newToes: UInt32 = 0
+        var newMid: UInt32 = 0
+        var newHeel: UInt32 = 0
+
+        for byte in data {
+            let low = byte & 0x0F
+            let high = (byte >> 4) & 0x0F
+
+            consumeNibble(low, total: &newTotal, toes: &newToes, mid: &newMid, heel: &newHeel)
+
+            if high != 0x0F {
+                consumeNibble(high, total: &newTotal, toes: &newToes, mid: &newMid, heel: &newHeel)
+            }
+        }
+
+        DispatchQueue.main.async {
+            self.stepsTotal &+= newTotal
+            self.stepsToes &+= newToes
+            self.stepsMid &+= newMid
+            self.stepsHeel &+= newHeel
+
+            if !self.statusText.hasPrefix("Upload complete") {
+                self.statusText = "Receiving… (\(self.stepsTotal) steps)"
+            }
+        }
+    }
+}
+
+// MARK: - Models
+enum Role: String, Codable, Hashable {
+    case caregiver
+    case physician
+}
+
+struct Patient: Identifiable, Hashable {
+    let id: String
+    var name: String
+}
+
+struct StepSession: Identifiable, Hashable {
+    let id: String
+    let totalSteps: Int
+    let totalPercent: Int
+    let toesPercent: Int
+    let midPercent: Int
+    let heelPercent: Int
+    let createdAt: Date
+}
+
+enum Screen: Hashable {
+    case patientDetail(Patient, String, Bool)
+}
+
+// MARK: - Firestore Services
+final class PatientService {
+    private let db = Firestore.firestore()
+
+    func fetchPatientsForPhysician(
+        physicianUid: String,
+        completion: @escaping (Result<[Patient], Error>) -> Void
+    ) {
+        db.collection("patients")
+            .whereField("physicianUid", isEqualTo: physicianUid)
+            .getDocuments { snapshot, error in
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
+
+                let patients = snapshot?.documents.compactMap { doc -> Patient? in
+                    let data = doc.data()
+                    guard let name = data["name"] as? String else { return nil }
+                    return Patient(id: doc.documentID, name: name)
+                } ?? []
+
+                completion(.success(patients))
+            }
+    }
+}
+
+final class PatientAssignmentService {
+    private let db = Firestore.firestore()
+
+    func createPatient(
+        name: String,
+        physicianEmail: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard let caregiverUid = Auth.auth().currentUser?.uid else {
+            completion(.failure(NSError(
+                domain: "PatientAssignmentService",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "No signed-in caregiver"]
+            )))
+            return
+        }
+
+        let cleanEmail = physicianEmail.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        db.collection("users")
+            .whereField("email", isEqualTo: cleanEmail)
+            .whereField("role", isEqualTo: "physician")
+            .getDocuments { snapshot, error in
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
+
+                guard let doc = snapshot?.documents.first else {
+                    completion(.failure(NSError(
+                        domain: "PatientAssignmentService",
+                        code: -2,
+                        userInfo: [NSLocalizedDescriptionKey: "No physician found with that email"]
+                    )))
+                    return
+                }
+
+                let physicianUid = doc.documentID
+                
+                self.db.collection("users").document(caregiverUid).updateData([
+                    "linkedPhysicianUid": physicianUid
+                ])
+
+                let patientData: [String: Any] = [
+                    "name": name,
+                    "caregiverUid": caregiverUid,
+                    "physicianUid": physicianUid,
+                    "createdAt": FieldValue.serverTimestamp()
+                ]
+
+                self.db.collection("patients").addDocument(data: patientData) { error in
+                    if let error {
+                        completion(.failure(error))
+                    } else {
+                        completion(.success(()))
+                    }
+                }
+            }
+    }
+}
+
+final class CaregiverLinkService {
+    private let db = Firestore.firestore()
+
+    func fetchLinkedPhysicianUid(
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        guard let caregiverUid = Auth.auth().currentUser?.uid else {
+            completion(.failure(NSError(
+                domain: "CaregiverLinkService",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "No signed-in caregiver."]
+            )))
+            return
+        }
+
+        db.collection("users").document(caregiverUid).getDocument { snapshot, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+
+            guard
+                let data = snapshot?.data(),
+                let physicianUid = data["linkedPhysicianUid"] as? String
+            else {
+                completion(.failure(NSError(
+                    domain: "CaregiverLinkService",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "No linked physician found"]
+                )))
+                return
+            }
+
+            completion(.success(physicianUid))
+        }
+    }
+}
+
+final class StepSessionService {
+    private let db = Firestore.firestore()
+
+    func saveSession(
+        patientId: String,
+        total: UInt32,
+        toes: UInt32,
+        mid: UInt32,
+        heel: UInt32,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        let totalInt = Int(total)
+
+        let toesPercent = totalInt > 0 ? Int((Double(toes) / Double(total)) * 100.0) : 0
+        let midPercent = totalInt > 0 ? Int((Double(mid) / Double(total)) * 100.0) : 0
+        let heelPercent = totalInt > 0 ? Int((Double(heel) / Double(total)) * 100.0) : 0
+
+        let data: [String: Any] = [
+            "totalSteps": totalInt,
+            "totalPercent": 100,
+            "toesPercent": toesPercent,
+            "midPercent": midPercent,
+            "heelPercent": heelPercent,
+            "createdAt": FieldValue.serverTimestamp()
+        ]
+
+        db.collection("patients")
+            .document(patientId)
+            .collection("sessions")
+            .addDocument(data: data) { error in
+                if let error {
+                    completion(.failure(error))
+                } else {
+                    completion(.success(()))
+                }
+            }
+    }
+
+    func fetchLastSixMonths(
+        patientId: String,
+        completion: @escaping (Result<[StepSession], Error>) -> Void
+    ) {
+        let cutoff = Calendar.current.date(byAdding: .month, value: -6, to: Date()) ?? Date()
+
+        db.collection("patients")
+            .document(patientId)
+            .collection("sessions")
+            .whereField("createdAt", isGreaterThanOrEqualTo: Timestamp(date: cutoff))
+            .order(by: "createdAt", descending: true)
+            .getDocuments { snapshot, error in
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
+
+                let sessions = snapshot?.documents.compactMap { doc -> StepSession? in
+                    let data = doc.data()
+                    guard
+                        let totalSteps = data["totalSteps"] as? Int,
+                        let totalPercent = data["totalPercent"] as? Int,
+                        let toesPercent = data["toesPercent"] as? Int,
+                        let midPercent = data["midPercent"] as? Int,
+                        let heelPercent = data["heelPercent"] as? Int,
+                        let ts = data["createdAt"] as? Timestamp
+                    else {
+                        return nil
+                    }
+
+                    return StepSession(
+                        id: doc.documentID,
+                        totalSteps: totalSteps,
+                        totalPercent: totalPercent,
+                        toesPercent: toesPercent,
+                        midPercent: midPercent,
+                        heelPercent: heelPercent,
+                        createdAt: ts.dateValue()
+                    )
+                } ?? []
+
+                completion(.success(sessions))
+            }
+    }
+}
+
+// MARK: - Auth Routing
+enum AppRoute: Equatable {
+    case signedOut
+    case caregiver(email: String)
+    case physician(email: String)
+}
+
+final class SessionStore: ObservableObject {
+    @Published var route: AppRoute = .signedOut
+    @Published var loading: Bool = true
+
+    private let db = Firestore.firestore()
+    private var authHandle: AuthStateDidChangeListenerHandle?
+
+    init() {
+        authHandle = Auth.auth().addStateDidChangeListener { [weak self] _, user in
+            guard let self else { return }
+
+            if let user {
+                self.fetchRoleAndRoute(uid: user.uid, email: user.email ?? "", attempt: 0)
+            } else {
+                DispatchQueue.main.async {
+                    self.loading = false
+                    self.route = .signedOut
+                }
+            }
+        }
+    }
+
+    private func fetchRoleAndRoute(uid: String, email: String, attempt: Int) {
+        DispatchQueue.main.async {
+            self.loading = true
+        }
+
+        db.collection("users").document(uid).getDocument { [weak self] snap, err in
+            guard let self else { return }
+
+            if let err {
+                print("Firestore read error:", err.localizedDescription)
+                DispatchQueue.main.async {
+                    self.loading = false
+                    self.route = .signedOut
+                }
+                return
+            }
+
+            guard
+                let data = snap?.data(),
+                let roleStr = data["role"] as? String
+            else {
+                if attempt < 6 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        self.fetchRoleAndRoute(uid: uid, email: email, attempt: attempt + 1)
+                    }
+                    return
+                }
+
+                try? Auth.auth().signOut()
+                DispatchQueue.main.async {
+                    self.loading = false
+                    self.route = .signedOut
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.loading = false
+                if roleStr == Role.physician.rawValue {
+                    self.route = .physician(email: email)
+                } else {
+                    self.route = .caregiver(email: email)
+                }
+            }
+        }
+    }
+
+    func signOut() {
+        try? Auth.auth().signOut()
+        route = .signedOut
+    }
+}
+
+final class AuthService {
+    private let db = Firestore.firestore()
+
+    func signIn(email: String, password: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        Auth.auth().signIn(withEmail: email, password: password) { _, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            completion(.success(()))
+        }
+    }
+
+    func createAccount(
+        email: String,
+        password: String,
+        role: Role,
+        accessCode: String? = nil,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        Auth.auth().createUser(withEmail: email, password: password) { [weak self] result, error in
+            guard let self else { return }
+
+            if let error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let user = result?.user else {
+                completion(.failure(
+                    NSError(
+                        domain: "AuthService",
+                        code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: "Missing created user."]
+                    )
+                ))
+                return
+            }
+
+            let uid = user.uid
+
+            if role == .physician {
+                let trimmedCode = (accessCode ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .uppercased()
+
+                guard !trimmedCode.isEmpty else {
+                    user.delete(completion: nil)
+                    completion(.failure(
+                        NSError(
+                            domain: "AuthService",
+                            code: -2,
+                            userInfo: [NSLocalizedDescriptionKey: "Physician access code is required."]
+                        )
+                    ))
+                    return
+                }
+
+                self.claimInviteAndCreatePhysician(uid: uid, email: email, accessCode: trimmedCode) { result in
+                    switch result {
+                    case .success:
+                        completion(.success(()))
+                    case .failure(let error):
+                        user.delete(completion: nil)
+                        completion(.failure(error))
+                    }
+                }
+
+            } else {
+                self.createUserDoc(uid: uid, email: email, role: .caregiver) { result in
+                    switch result {
+                    case .success:
+                        completion(.success(()))
+                    case .failure(let error):
+                        user.delete(completion: nil)
+                        completion(.failure(error))
+                    }
+                }
+            }
+        }
+    }
+
+    private func createUserDoc(
+        uid: String,
+        email: String,
+        role: Role,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        let doc: [String: Any] = [
+            "email": email,
+            "role": role.rawValue,
+            "createdAt": FieldValue.serverTimestamp()
+        ]
+
+        db.collection("users").document(uid).setData(doc) { error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            completion(.success(()))
+        }
+    }
+
+    private func claimInviteAndCreatePhysician(
+        uid: String,
+        email: String,
+        accessCode: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        let inviteRef = db.collection("invites").document(accessCode)
+        let userRef = db.collection("users").document(uid)
+
+        db.runTransaction({ transaction, errorPointer in
+            let inviteSnap: DocumentSnapshot
+
+            do {
+                inviteSnap = try transaction.getDocument(inviteRef)
+            } catch let error as NSError {
+                errorPointer?.pointee = error
+                return nil
+            }
+
+            guard let data = inviteSnap.data() else {
+                errorPointer?.pointee = NSError(
+                    domain: "AuthService",
+                    code: -3,
+                    userInfo: [NSLocalizedDescriptionKey: "Invalid physician access code."]
+                )
+                return nil
+            }
+
+            let used = (data["used"] as? Bool) ?? false
+            let role = (data["role"] as? String) ?? ""
+
+            guard role == Role.physician.rawValue else {
+                errorPointer?.pointee = NSError(
+                    domain: "AuthService",
+                    code: -4,
+                    userInfo: [NSLocalizedDescriptionKey: "This code is not for physician signup."]
+                )
+                return nil
+            }
+
+            guard used == false else {
+                errorPointer?.pointee = NSError(
+                    domain: "AuthService",
+                    code: -5,
+                    userInfo: [NSLocalizedDescriptionKey: "This physician access code has already been used."]
+                )
+                return nil
+            }
+
+            transaction.updateData([
+                "used": true,
+                "usedBy": uid,
+                "usedAt": FieldValue.serverTimestamp()
+            ], forDocument: inviteRef)
+
+            transaction.setData([
+                "email": email,
+                "role": Role.physician.rawValue,
+                "createdAt": FieldValue.serverTimestamp()
+            ], forDocument: userRef)
+
+            return nil
+        }) { _, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            completion(.success(()))
+        }
+    }
+}
+
+// MARK: - Shared Summary Card
+struct StepBarDatum: Identifiable {
+    let id = UUID()
+    let label: String
+    let value: Int
+}
+
+struct StepSummaryCard: View {
+    let total: UInt32
+    let toes: UInt32
+    let mid: UInt32
+    let heel: UInt32
+
+    private func pct(_ x: UInt32) -> Int {
+        guard total > 0 else { return 0 }
+        return Int((Double(x) / Double(total)) * 100.0)
+    }
+
+    private var chartData: [StepBarDatum] {
+        [
+            .init(label: "Total", value: Int(total)),
+            .init(label: "Toes", value: Int(toes)),
+            .init(label: "Mid", value: Int(mid)),
+            .init(label: "Heel", value: Int(heel))
+        ]
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Total steps").font(.headline)
+                Spacer()
+                Text("\(Int(total))").font(.headline)
+            }
+
+            Chart(chartData) { item in
+                BarMark(
+                    x: .value("Category", item.label),
+                    y: .value("Steps", item.value)
+                )
+            }
+            .frame(height: 180)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack { Text("Toes active"); Spacer(); Text("\(pct(toes))%") }
+                HStack { Text("Midfoot active"); Spacer(); Text("\(pct(mid))%") }
+                HStack { Text("Heel active"); Spacer(); Text("\(pct(heel))%") }
+            }
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+        }
+        .padding()
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+}
+
+// MARK: - BLEDevicePickerview
+struct BLEDevicePickerView: View {
+    @ObservedObject var ble: WalkPressureBLE
+
+    var body: some View {
+        VStack(spacing: 14) {
+
+            // Title
+            HStack {
+                Image(systemName: "dot.radiowaves.left.and.right")
+                Text("Device Connection")
+                    .font(.headline)
+                Spacer()
+            }
+
+            // Connection status badge
+            HStack {
+                Circle()
+                    .fill(ble.isConnected ? Color.green : Color.orange)
+                    .frame(width: 10, height: 10)
+
+                Text(ble.isConnected ? "Connected" : "Not Connected")
+                    .font(.subheadline)
+
+                Spacer()
+            }
+
+            // Scan + Disconnect buttons
+            HStack(spacing: 12) {
+                Button(action: {
+                    ble.startScan()
+                }) {
+                    Label("Scan", systemImage: "magnifyingglass")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+
+                if ble.isConnected {
+                    Button(action: {
+                        ble.disconnectCurrentDevice()
+                    }) {
+                        Label("Disconnect", systemImage: "xmark.circle")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+            // Device list
+            if ble.discoveredDevices.isEmpty {
+                Text("Tap “Scan” to find nearby devices")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .padding(.top, 4)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(ble.discoveredDevices) { device in
+                        Button(action: {
+                            ble.connectToDevice(device)
+                        }) {
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(device.name)
+                                        .fontWeight(.medium)
+
+                                    Text("Signal: \(device.rssi)")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+
+                                Spacer()
+
+                                if ble.selectedDeviceID == device.id && ble.isConnected {
+                                    Text("Connected")
+                                        .font(.caption)
+                                        .padding(6)
+                                        .background(Color.green.opacity(0.2))
+                                        .cornerRadius(6)
+                                } else {
+                                    Text("Connect")
+                                        .font(.caption)
+                                        .padding(6)
+                                        .background(Color.blue.opacity(0.2))
+                                        .cornerRadius(6)
+                                }
+                            }
+                            .padding()
+                            .background(Color(.systemGray6))
+                            .cornerRadius(12)
+                        }
+                    }
+                }
+            }
+        }
+        .padding()
+        .background(Color(.systemBackground))
+        .cornerRadius(16)
+        .shadow(color: .black.opacity(0.05), radius: 5)
+    }
+}
+// MARK: - Root View
+struct RootView: View {
+    @StateObject private var ble = WalkPressureBLE()
+    @StateObject private var session = SessionStore()
+    @State private var path: [Screen] = []
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            content
+                .navigationDestination(for: Screen.self) { screen in
+                    switch screen {
+                    case .patientDetail(let patient, let physician, let canSaveSession):
+                        PatientDetailView(
+                            patient: patient,
+                            physician: physician,
+                            canSaveSession: canSaveSession
+                            )
+                        .environmentObject(ble)
+                    }
+                }
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if session.loading {
+            ProgressView("Loading…")
+        } else {
+            switch session.route {
+            case .signedOut:
+                WelcomeView()
+
+            case .caregiver(let email):
+                ParentDashboardView(
+                    username: email,
+                    onLogout: {
+                        session.signOut()
+                        path.removeAll()
+                    }
+                )
+                .environmentObject(ble)
+
+            case .physician(let email):
+                PhysicianDashboardView(
+                    username: email,
+                    onSelectPatient: { patient in
+                        path.append(.patientDetail(patient, email, false))
+                    },
+                    onLogout: {
+                        session.signOut()
+                        path.removeAll()
+                    }
+                )
+                .environmentObject(ble)
+            }
+        }
+    }
+}
+
+// MARK: - Welcome Page
+struct WelcomeView: View {
+    @State private var selectedRoleForSignup: Role = .caregiver
+    @State private var showingAuthSheet: Bool = false
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            Text("Welcome")
+                .font(.largeTitle)
+                .bold()
+
+            Text("Sign in or create an account")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            VStack(spacing: 16) {
+                Button {
+                    selectedRoleForSignup = .caregiver
+                    showingAuthSheet = true
+                } label: {
+                    Label("Sign in", systemImage: "person.fill.checkmark")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+
+                VStack(spacing: 10) {
+                    Text("Create account as")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Button {
+                        selectedRoleForSignup = .caregiver
+                        showingAuthSheet = true
+                    } label: {
+                        Label("Caregiver", systemImage: "person.2.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        selectedRoleForSignup = .physician
+                        showingAuthSheet = true
+                    } label: {
+                        Label("Physician (access code required)", systemImage: "stethoscope")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.top, 6)
+            }
+            .padding(.horizontal)
+
+            Spacer()
+        }
+        .padding()
+        .sheet(isPresented: $showingAuthSheet) {
+            NavigationStack {
+                AuthView(initialSignupRole: selectedRoleForSignup)
+            }
+        }
+    }
+}
+
+// MARK: - Forgot Password
+struct ForgotPasswordView: View {
+    @State private var email: String = ""
+    @State private var statusMessage: String?
+    @State private var isSending = false
+
+    var body: some View {
+        Form {
+            Section(header: Text("Reset password")) {
+                TextField("Email address", text: $email)
+                    .keyboardType(.emailAddress)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+
+            Section {
+                Button {
+                    sendReset()
+                } label: {
+                    HStack {
+                        Spacer()
+                        if isSending {
+                            ProgressView()
+                        } else {
+                            Text("Send reset email")
+                        }
+                        Spacer()
+                    }
+                }
+                .disabled(isSending || email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            if let statusMessage {
+                Section {
+                    Text(statusMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .navigationTitle("Forgot Password")
+    }
+
+    private func sendReset() {
+        let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanEmail.isEmpty else { return }
+
+        isSending = true
+        statusMessage = nil
+
+        Auth.auth().sendPasswordReset(withEmail: cleanEmail) { error in
+            isSending = false
+            if let error {
+                statusMessage = "Could not send reset email: \(error.localizedDescription)"
+            } else {
+                statusMessage = "If an account exists for \(cleanEmail), you’ll receive an email with reset instructions."
+            }
+        }
+    }
+}
+
+// MARK: - Authentication View
+struct AuthView: View {
+    enum Mode { case signIn, signUp }
+
+    let initialSignupRole: Role
+
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var mode: Mode = .signIn
+    @State private var email: String = ""
+    @State private var password: String = ""
+    @State private var signupRole: Role = .caregiver
+    @State private var accessCode: String = ""
+
+    @State private var isWorking: Bool = false
+    @State private var showError: Bool = false
+    @State private var errorMessage: String = "Something went wrong."
+
+    private let auth = AuthService()
+
+    init(initialSignupRole: Role) {
+        self.initialSignupRole = initialSignupRole
+        _signupRole = State(initialValue: initialSignupRole)
+        _mode = State(initialValue: .signIn)
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("Mode", selection: $mode) {
+                    Text("Sign In").tag(Mode.signIn)
+                    Text("Create Account").tag(Mode.signUp)
+                }
+                .pickerStyle(.segmented)
+            }
+
+            Section(header: Text(mode == .signIn ? "Sign in" : "Create account")) {
+                TextField("Email", text: $email)
+                    .textContentType(.username)
+                    .keyboardType(.emailAddress)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                SecureField("Password", text: $password)
+                    .textContentType(.password)
+
+                if mode == .signUp {
+                    Picker("Role", selection: $signupRole) {
+                        Text("Caregiver").tag(Role.caregiver)
+                        Text("Physician").tag(Role.physician)
+                    }
+
+                    if signupRole == .physician {
+                        TextField("Physician access code", text: $accessCode)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                    }
+                }
+
+                NavigationLink("Forgot password?", destination: ForgotPasswordView())
+                    .font(.footnote)
+            }
+
+            Section {
+                Button {
+                    submit()
+                } label: {
+                    HStack {
+                        Spacer()
+                        if isWorking {
+                            ProgressView()
+                        } else {
+                            Text(mode == .signIn ? "Sign In" : "Create Account")
+                        }
+                        Spacer()
+                    }
+                }
+                .disabled(isWorking)
+            }
+        }
+        .navigationTitle("Account")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Done") { dismiss() }
+            }
+        }
+        .alert("Error", isPresented: $showError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(errorMessage)
+        }
+    }
+
+    private func submit() {
+        let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanCode = accessCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+
+        guard !cleanEmail.isEmpty else {
+            fail("Please enter your email.")
+            return
+        }
+
+        guard !password.isEmpty else {
+            fail("Please enter your password.")
+            return
+        }
+
+        if mode == .signUp && signupRole == .physician && cleanCode.isEmpty {
+            fail("Please enter the physician access code.")
+            return
+        }
+
+        isWorking = true
+
+        switch mode {
+        case .signIn:
+            auth.signIn(email: cleanEmail, password: password) { result in
+                DispatchQueue.main.async {
+                    self.isWorking = false
+                    switch result {
+                    case .success:
+                        self.dismiss()
+                    case .failure(let err):
+                        self.fail(err.localizedDescription)
+                    }
+                }
+            }
+
+        case .signUp:
+            auth.createAccount(
+                email: cleanEmail,
+                password: password,
+                role: signupRole,
+                accessCode: signupRole == .physician ? cleanCode : nil
+            ) { result in
+                DispatchQueue.main.async {
+                    self.isWorking = false
+                    switch result {
+                    case .success:
+                        self.dismiss()
+                    case .failure(let err):
+                        self.fail(err.localizedDescription)
+                    }
+                }
+            }
+        }
+    }
+
+    private func fail(_ msg: String) {
+        print("AUTH ERROR:", msg)
+        errorMessage = msg
+        showError = true
+    }
+}
+
+// MARK: - Dashboards
+struct ParentDashboardView: View {
+    let username: String
+    var onLogout: () -> Void
+    
+    @EnvironmentObject var ble: WalkPressureBLE
+    @State private var showingCreatePatient = false
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Caregiver Home")
+                .font(.largeTitle)
+                .bold()
+
+            Text("Signed in as \(username)")
+                .foregroundStyle(.secondary)
+
+            VStack(spacing: 6) {
+                Text(ble.isConnected ? "Connected to BLE_StepLogger" : "Connecting…")
+                    .foregroundColor(ble.isConnected ? .green : .orange)
+                    .font(.subheadline)
+
+                Text(ble.statusText)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal)
+
+            BLEDevicePickerView(ble: ble)
+            
+            StepSummaryCard(
+                total: ble.stepsTotal,
+                toes: ble.stepsToes,
+                mid: ble.stepsMid,
+                heel: ble.stepsHeel
+            )
+
+            
+            Button("Link your physician") {
+                showingCreatePatient = true
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.horizontal)
+
+            Button(role: .destructive) {
+                onLogout()
+            } label: {
+                Text("Log out")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .padding(.horizontal)
+        }
+        .padding()
+        
+        .sheet(isPresented: $showingCreatePatient) {
+            NavigationStack {
+                CreatePatientView()
+            }
+        }
+    }
+    
+}
+
+struct CreatePatientView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var patientName: String = ""
+    @State private var physicianEmail: String = ""
+    @State private var statusMessage: String?
+    @State private var isWorking = false
+
+    private let assignmentService = PatientAssignmentService()
+
+    var body: some View {
+        Form {
+            Section(header: Text("New Patient")) {
+                TextField("Patient name", text: $patientName)
+                TextField("Physician email", text: $physicianEmail)
+                    .keyboardType(.emailAddress)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+
+            Section {
+                Button("Create Patient") {
+                    createPatient()
+                }
+                .disabled(isWorking || patientName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || physicianEmail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            if let statusMessage {
+                Section {
+                    Text(statusMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .navigationTitle("Link your physician")
+    }
+
+    private func createPatient() {
+        isWorking = true
+        statusMessage = nil
+
+        assignmentService.createPatient(
+            name: patientName.trimmingCharacters(in: .whitespacesAndNewlines),
+            physicianEmail: physicianEmail
+        ) { result in
+            DispatchQueue.main.async {
+                isWorking = false
+                switch result {
+                case .success:
+                    statusMessage = "Patient created and assigned."
+                    dismiss()
+                case .failure(let error):
+                    statusMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+}
+
+struct PhysicianDashboardView: View {
+    let username: String
+    var onSelectPatient: (Patient) -> Void
+    var onLogout: () -> Void
+
+    @EnvironmentObject var ble: WalkPressureBLE
+    @State private var patients: [Patient] = []
+    @State private var errorMessage: String?
+
+    private let patientService = PatientService()
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Physician Home")
+                .font(.largeTitle)
+                .bold()
+
+            Text("Signed in as \(username)")
+                .foregroundStyle(.secondary)
+
+            BLEDevicePickerView(ble: ble)
+
+            
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+
+            List {
+                Section("Patient list") {
+                    if patients.isEmpty {
+                        Text("No assigned patients yet.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(patients) { patient in
+                            Button {
+                                onSelectPatient(patient)
+                            } label: {
+                                HStack {
+                                    Image(systemName: "person.crop.circle")
+                                    Text(patient.name)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Button(role: .destructive) {
+                onLogout()
+            } label: {
+                Text("Log out")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .padding(.horizontal)
+        }
+        .padding()
+        .onAppear {
+            loadPatients()
+        }
+    }
+
+    private func loadPatients() {
+        guard let uid = Auth.auth().currentUser?.uid else {
+            errorMessage = "No signed-in physician."
+            return
+        }
+
+        patientService.fetchPatientsForPhysician(physicianUid: uid) { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let loadedPatients):
+                    self.patients = loadedPatients
+                    self.errorMessage = nil
+                case .failure(let error):
+                    self.errorMessage = "Failed to load patients: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+}
+
+struct PatientDetailView: View {
+    let patient: Patient
+    let physician: String
+    let canSaveSession: Bool
+
+    @EnvironmentObject var ble: WalkPressureBLE
+
+    private let sessionService = StepSessionService()
+
+    @State private var sessions: [StepSession] = []
+    @State private var saveMessage: String?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text(patient.name)
+                .font(.largeTitle)
+                .bold()
+
+            Text("Assigned physician \(physician)")
+                .foregroundStyle(.secondary)
+
+            StepSummaryCard(
+                total: ble.stepsTotal,
+                toes: ble.stepsToes,
+                mid: ble.stepsMid,
+                heel: ble.stepsHeel
+            )
+
+                Button("Save This Session") {
+                    saveCurrentSession()
+                }
+                .buttonStyle(.borderedProminent)
+            
+
+            if let saveMessage {
+                Text(saveMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+
+            List(sessions) { session in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(session.createdAt.formatted())
+                        .font(.headline)
+                    Text("Total steps: \(session.totalSteps)");  Text("Toes: \(session.toesPercent)%  Mid: \(session.midPercent)%  Heel: \(session.heelPercent)%")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding()
+        .onAppear {
+            loadSessions()
+        }
+    }
+
+    private func saveCurrentSession() {
+        sessionService.saveSession(
+            patientId: patient.id,
+            total: ble.stepsTotal,
+            toes: ble.stepsToes,
+            mid: ble.stepsMid,
+            heel: ble.stepsHeel
+        ) { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success:
+                    self.saveMessage = "Session saved"
+                    self.errorMessage = nil
+                    loadSessions()
+                case .failure(let error):
+                    self.errorMessage = "Save failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func loadSessions() {
+        sessionService.fetchLastSixMonths(patientId: patient.id) { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let loaded):
+                    self.sessions = loaded
+                    self.errorMessage = nil
+                case .failure(let error):
+                    self.errorMessage = "Failed to load sessions: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+}
